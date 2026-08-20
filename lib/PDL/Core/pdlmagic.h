@@ -114,6 +114,11 @@ void pdl_run_delayed_magic(void);
 
 /* Deferred barfing and warning when pthreading  */
 char pdl_pthread_main_thread(void);
+/* Around an offloaded transformation: the first two on the backend's worker
+ * thread, the last back on the interpreter thread.  One at a time (see pdlapi.c) */
+void pdl_offload_ctx_install(void);
+void pdl_offload_ctx_uninstall(void);
+void pdl_offload_ctx_flush(void);
 int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args);
 void pdl_pthread_realloc_vsnprintf(char **p, size_t *len, size_t extralen, const char *pat, va_list *args, char add_newline);
 void pdl_pthread_free(void *p);

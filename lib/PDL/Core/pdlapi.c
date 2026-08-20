@@ -22,6 +22,15 @@ extern Core PDL; /* for PDL_TYPENAME */
  * outside the bracket, because on a threaded perl those go through the PerlHost
  * layer and need an interpreter context a worker thread does not have.
  *
+ * Auto-pthreading is not an alternative to this but a layer under it: the worker
+ * thread runs the broadcast loop, and the loop fans itself out over pthreads and
+ * joins them, so a transformation gets its cores and the interpreter is free at the
+ * same time.  Two things have to be arranged for that to hold, both here:
+ * the per-pthread scratch ndarrays are made physical before we hand over
+ * (pdl_offload_prepare_temps), since allocating one goes through perl; and the
+ * warnings those pthreads defer are replayed after we get back
+ * (pdl_offload_ctx_flush), for the same reason.
+ *
  * With no offload backend installed multicore_offload() runs the work inline, so
  * this changes nothing for anyone who has not installed one. */
 
@@ -30,13 +39,20 @@ extern Core PDL; /* for PDL_TYPENAME */
  * `job.trans` by the preprocessor. */
 struct pdl_offload_job { pdl_trans *otrans; pdl_error err; };
 
+/* Only read and written on the interpreter thread - eligibility is decided there,
+ * and so is the hand-back - so it needs no atomicity. */
+static int pdl_offload_in_flight = 0;
 
 static void
 pdl_offload_work (void *arg, const perl_multicore_work_ctx *ctx)
 {
   struct pdl_offload_job *j = arg;
   (void)ctx;                     /* cancellation is not offered yet */
+  /* There is no interpreter on this thread, so a pthread fan-out inside the
+   * transformation must not report its warnings here; they come back with us. */
+  pdl_offload_ctx_install ();
   j->err = j->otrans->vtable->readdata (j->otrans);
+  pdl_offload_ctx_uninstall ();
 }
 
 static SV *
@@ -47,6 +63,37 @@ pdl_offload_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx)
    * so the result is where the caller will look for it either way.  An immortal,
    * so discarding multicore_offload's return value leaks nothing. */
   return &PL_sv_undef;
+}
+
+/* Give each pthread its scratch ndarray before the transformation is handed over.
+ * pdl_startbroadcastloop does exactly this when it fans out, but by then we are on
+ * a worker thread and making an ndarray physical allocates - through perl.  Doing
+ * it first leaves that one nothing to do, since it finds the temporaries already
+ * the right shape and already physical.
+ */
+static pdl_error
+pdl_offload_prepare_temps (pdl_trans *trans)
+{
+  pdl_error PDL_err = {0, NULL, 0};
+  pdl_broadcast *broadcast = &trans->broadcast;
+  PDL_Indx i;
+
+  /* not fanning out, so there is nothing to divide up */
+  if ((broadcast->gflags & PDL_BROADCAST_MAGICKED) != PDL_BROADCAST_MAGICKED
+      || broadcast->mag_nthr <= 0)
+    return PDL_err;
+
+  for (i = 0; i < trans->vtable->npdls; i++) {
+    pdl *it;
+    if (!(trans->vtable->par_flags[i] & PDL_PARAM_ISTEMP)) continue;
+    it = broadcast->pdls[i];
+    if (!it || !it->ndims) continue;
+    it->dims[it->ndims-1] = broadcast->mag_nthr;
+    pdl_resize_defaultincs(it);
+    PDL_RETERROR(PDL_err, pdl_make_physical(it));
+  }
+
+  return PDL_err;
 }
 
 /* Deliberately conservative.  Anything here that cannot be shown safe is left to
@@ -66,18 +113,18 @@ pdl_offload_eligible (pdl_trans *trans)
   /* the op declares itself unsafe to run in parallel (PP's NoPthread) */
   if (vtable->flags & PDL_TRANS_NO_PARALLEL) return 0;
 
-  for (i = 0; i < vtable->npdls; i++) {
-    /* Temporaries exist to give each pthread its own scratch, and they are
-     * allocated from inside the loop - which would put an allocation, and so
-     * perl, on the worker thread.  Such ops stay inline. */
-    if (vtable->par_flags[i] & PDL_PARAM_ISTEMP) return 0;
+  for (i = 0; i < vtable->npdls; i++)
     if (trans->pdls[i] && trans->pdls[i]->nvals > biggest)
       biggest = trans->pdls[i]->nvals;
-  }
 
-  /* Auto-pthreading already parallelises this op from the inside, and nesting the
-   * two would multiply the thread count.  Whoever asked for pthreads gets them. */
-  if (pdl_autopthread_targ > 1) return 0;
+  /* Auto-pthreading composes with offloading rather than competing with it: the
+   * worker fans the broadcast loop out over pthreads and joins them, so the op
+   * still gets its cores while the interpreter is free.  What does not compose is
+   * the context an offloaded transformation leaves for those pthreads to complain
+   * into (see pdl_offload_ctx_install), which is a single one - so one offloaded
+   * transformation at a time.  A second runs inline, costing only its own
+   * concurrency. */
+  if (pdl_offload_in_flight) return 0;
 
   /* Same units as set_autopthread_size (M-elements) and the same reasoning: the
    * handshake costs a mutex, a condvar and an event-loop round trip, so it only
@@ -105,11 +152,15 @@ pdl_offload_eligible (pdl_trans *trans)
     if (is_fwd && pdl_offload_eligible(trans)) { \
       struct pdl_offload_job job; \
       job.otrans = (trans); \
-      pdl_error zero = {0, NULL, 0}; \
-      job.err = zero; \
-      /* the return value is done()'s immortal undef; the real result is in the \
-       * ndarrays and the status is in job.err */ \
-      (void)multicore_offload(pdl_offload_work, &job, pdl_offload_done, NULL); \
+      job.err = pdl_offload_prepare_temps(trans); \
+      if (!job.err.error) { \
+        pdl_offload_in_flight = 1; \
+        /* the return value is done()'s immortal undef; the real result is in the \
+         * ndarrays and the status is in job.err */ \
+        (void)multicore_offload(pdl_offload_work, &job, pdl_offload_done, NULL); \
+        pdl_offload_in_flight = 0; \
+        pdl_offload_ctx_flush(); /* anything the pthreads had to say */ \
+      } \
       errcall(PDL_err, job.err); \
     } else \
     errcall(PDL_err, (vtable->func \
