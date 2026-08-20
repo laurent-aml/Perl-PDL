@@ -2,26 +2,6 @@
 
 #ifdef PDL_PTHREAD
 
-/* We can only barf/warn from a thread that holds the interpreter, so a worker
- * pthread complains into a buffer and the thread that spawned it reports the lot
- * afterwards.  One of these holds those buffers.
- *
- * There is one per in-flight pdl_magic_thread_cast, plus one for an offloaded
- * transformation, and a worker reaches its own through thread-local storage.  That
- * is what lets a fan-out running on an offload backend's worker coexist with the
- * interpreter thread, which is free to run another transformation meanwhile:
- * each side complains to its own cast, and neither mistakes itself for the other.
- */
-typedef struct pdl_pthread_ctx {
-  char  *barf_msgs;
-  size_t barf_msgs_len;
-  char  *warn_msgs;
-  size_t warn_msgs_len;
-  char is_root;      /* an offloaded transformation, not a spawned worker: it may
-                      * not pthread_exit, so it barfs the ordinary way */
-  char defer_warns;  /* ... and it has no interpreter, so warnings travel home */
-} pdl_pthread_ctx;
-
 static pthread_key_t pdl_pthread_ctx_key;
 static pthread_once_t pdl_pthread_ctx_once = PTHREAD_ONCE_INIT;
 
@@ -317,10 +297,12 @@ pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans
 	pthread_key_create(&(ptr->key),NULL);
 	/* Where the pthreads we are about to spawn will leave anything they have to
 	 * say; they find it through TLS, and we report it once they have joined. */
-	pdl_pthread_ctx ctx = {NULL, 0, NULL, 0, 0, 0};
+	pdl_pthread_ctx ctx = {NULL, 0, NULL, 0, 0, 0, NULL};
 	/* Set if we are ourselves running inside an offloaded transformation, in which
-	 * case there is no interpreter here to warn with. */
+	 * case there is no interpreter here to warn with - and the work may have been
+	 * asked to stop, which the pthreads we spawn should hear about too. */
 	pdl_pthread_ctx *outer = pdl_pthread_ctx_get();
+	if (outer) ctx.cancel = outer->cancel;
 
 	PDLDEBUG_f(printf("CREATING THREADS, ME: TBD, key: %ld\n", (unsigned long)(ptr->key)));
 	PDL_Indx i, last_pthread = -1;
@@ -420,31 +402,38 @@ pdl_error pdl_add_threading_magic(pdl *it,PDL_Indx nthdim,PDL_Indx nthreads)
 
 /* An offloaded transformation runs on a backend's worker thread, which has no
  * interpreter.  Installing a context there gives a pthread fan-out inside it
- * somewhere to leave its warnings, and pdl_offload_ctx_flush reports them once the
- * handshake has put us back on the interpreter thread.
+ * somewhere to leave its warnings, and carries the backend's stop flag to those
+ * pthreads; pdl_offload_ctx_flush reports the warnings once the handshake has put
+ * us back on the interpreter thread.
  *
- * The context is static, and so this is only good for one offloaded
- * transformation at a time; pdlapi.c enforces that before offloading.  Static
- * because install() runs on the worker, where allocating would mean calling into
- * perl - the very thing offloading exists to avoid.
- */
-static pdl_pthread_ctx pdl_offload_ctx;
+ * The context belongs to the caller - it lives in the frame that is waiting for
+ * the offload - because install () runs on the worker, where allocating one would
+ * mean calling into perl, the very thing offloading exists to avoid. */
+void pdl_offload_ctx_install(pdl_pthread_ctx *ctx, volatile int *cancel) {
+  *ctx = (pdl_pthread_ctx){NULL, 0, NULL, 0, 1, 1, cancel};
+  pdl_pthread_ctx_set(ctx);
+}
 
-void pdl_offload_ctx_install(void) {
-  pdl_offload_ctx = (pdl_pthread_ctx){NULL, 0, NULL, 0, 1, 1};
-  pdl_pthread_ctx_set(&pdl_offload_ctx);
+/* The word to poll to find out whether the transformation this thread is running
+ * has been asked to stop, or NULL if it cannot be: the broadcast loop reads this
+ * once per chunk (see PDL_BROADCASTLOOP_START).  It is per-thread, so an ordinary
+ * inline transformation running on the interpreter thread at the same time as an
+ * offloaded one is unaffected by the latter's cancellation. */
+volatile int *pdl_offload_cancel_ptr(void) {
+  pdl_pthread_ctx *ctx = pdl_pthread_ctx_get();
+  return ctx ? ctx->cancel : NULL;
 }
 
 void pdl_offload_ctx_uninstall(void) {
   pdl_pthread_ctx_set(NULL);
 }
 
-void pdl_offload_ctx_flush(void) {
-  if (pdl_offload_ctx.warn_msgs_len) {
-    pdl_offload_ctx.warn_msgs_len = 0;
-    pdl_pdl_warn("%s", pdl_offload_ctx.warn_msgs);
-    free(pdl_offload_ctx.warn_msgs);
-    pdl_offload_ctx.warn_msgs = NULL;
+void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx) {
+  if (ctx->warn_msgs_len) {
+    ctx->warn_msgs_len = 0;
+    pdl_pdl_warn("%s", ctx->warn_msgs);
+    free(ctx->warn_msgs);
+    ctx->warn_msgs = NULL;
   }
 }
 
@@ -582,9 +571,16 @@ int pdl_online_cpus(void)
 /* Dummy versions */
 pdl_error pdl_add_threading_magic(pdl *it,PDL_Indx nthdim,PDL_Indx nthreads) {pdl_error PDL_err = {0,NULL,0}; return PDL_err;}
 char pdl_pthread_main_thread() { return 1; }
-void pdl_offload_ctx_install(void) {}
+/* Without pthreads there is no thread-local storage to hang a context on, so an
+ * offloaded transformation has nowhere to keep its cancel flag that the
+ * interpreter thread's own loops would not also read.  It is simply not
+ * cancellable in this configuration. */
+void pdl_offload_ctx_install(pdl_pthread_ctx *ctx, volatile int *cancel) {
+  (void)ctx; (void)cancel;
+}
 void pdl_offload_ctx_uninstall(void) {}
-void pdl_offload_ctx_flush(void) {}
+void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx) { (void)ctx; }
+volatile int *pdl_offload_cancel_ptr(void) { return NULL; }
 int pdl_magic_get_thread(pdl *it) {return 0;}
 pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans *t, pdl_broadcast *broadcast) {pdl_error PDL_err = {0,NULL,0}; return PDL_err;}
 int pdl_magic_thread_nthreads(pdl *it,PDL_Indx *nthdim) {return 0;}

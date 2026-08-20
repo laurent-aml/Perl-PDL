@@ -3,7 +3,7 @@
 
 /* version 20: memory-management changes */
 /* on 21, look for comments "CORE21", unify pdl_trans per_pdl_flags, par_flags; remove threadloop #defines; change creating to char; relocate struct pdl.value appropriately, remove pdl_null, safe_indterm, initbroadcaststruct to take trans & remove in[cd]_sizes, remove pdl_{read,writeback}data_affine */
-#define PDL_CORE_VERSION 20
+#define PDL_CORE_VERSION 21
 #define startbroadcastloop startthreadloop
 #define pdl_startbroadcastloop pdl_startthreadloop
 #define iterbroadcastloop iterthreadloop
@@ -160,6 +160,7 @@ void pdl_dump_anyval(PDL_Anyval v);
   X(unpackpdls, SV*, ( pdl **, PDL_Indx npdls )) \
   X(packstrings, char **, ( SV* sv, PDL_Indx *nstrings )) \
   X(prealloc_trans_children, pdl_error, (pdl *it, PDL_Indx howmany)) \
+  X(offload_cancel_ptr, volatile int *, (void)) /* advisory stop flag, or NULL */ \
 
 /*************** Function prototypes *********************/
 #define X(sym, rettype, args) \

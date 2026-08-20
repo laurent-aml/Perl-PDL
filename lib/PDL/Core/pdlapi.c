@@ -37,22 +37,48 @@ extern Core PDL; /* for PDL_TYPENAME */
 /* member deliberately not called `trans`: this struct is used inside
  * VTABLE_OR_DEFAULT, whose parameter of that name would be substituted into
  * `job.trans` by the preprocessor. */
-struct pdl_offload_job { pdl_trans *otrans; pdl_error err; };
-
-/* Only read and written on the interpreter thread - eligibility is decided there,
- * and so is the hand-back - so it needs no atomicity. */
-static int pdl_offload_in_flight = 0;
+struct pdl_offload_job {
+  pdl_trans *otrans;
+  pdl_error err;
+  int cancelled;
+  pdl_pthread_ctx pctx;   /* the worker's context: ours, because the worker cannot
+                           * make one without calling perl.  Lives as long as this
+                           * job does, which is as long as the work runs. */
+};
 
 static void
 pdl_offload_work (void *arg, const perl_multicore_work_ctx *ctx)
 {
   struct pdl_offload_job *j = arg;
-  (void)ctx;                     /* cancellation is not offered yet */
-  /* There is no interpreter on this thread, so a pthread fan-out inside the
-   * transformation must not report its warnings here; they come back with us. */
-  pdl_offload_ctx_install ();
+  /* The context is where the backend leaves the advisory stop flag; it also has to
+   * reach the pthreads a fan-out spawns, which is what the installed context is
+   * for.  And there is no interpreter on this thread, so warnings that fan-out
+   * defers must not be reported here either - they come back with us. */
+  volatile int *cancel = ctx && ctx->size >= sizeof (*ctx) ? ctx->cancel : NULL;
+
+  pdl_offload_ctx_install (&j->pctx, cancel);
   j->err = j->otrans->vtable->readdata (j->otrans);
   pdl_offload_ctx_uninstall ();
+
+  if (cancel && *cancel)
+    {
+      j->cancelled = 1;
+
+      /* Mark the transformation itself, not just the job: if the backend delivers
+       * an exception to the caller, control never comes back here, and the frames
+       * being unwound would otherwise flush this very transformation on their way
+       * out (pdl_destroytransform).  Written from the worker, but only the
+       * suspended caller owns this trans, and only after this does anyone read it. */
+      j->otrans->flags |= PDL_ITRANS_CANCELLED;
+
+      /* The loop stopped in the middle, so whatever is in the outputs is partial.
+       * Say so: this is the caller's only sign that the values are not the ones it
+       * asked for.  An error the transformation raised on its own says more, so it
+       * wins. */
+      if (!j->err.error)
+        j->err = pdl_make_error (PDL_EUSERERROR, "%s: cancelled",
+                                 j->otrans->vtable->name);
+    }
 }
 
 static SV *
@@ -119,12 +145,7 @@ pdl_offload_eligible (pdl_trans *trans)
 
   /* Auto-pthreading composes with offloading rather than competing with it: the
    * worker fans the broadcast loop out over pthreads and joins them, so the op
-   * still gets its cores while the interpreter is free.  What does not compose is
-   * the context an offloaded transformation leaves for those pthreads to complain
-   * into (see pdl_offload_ctx_install), which is a single one - so one offloaded
-   * transformation at a time.  A second runs inline, costing only its own
-   * concurrency. */
-  if (pdl_offload_in_flight) return 0;
+   * still gets its cores while the interpreter is free. */
 
   /* Same units as set_autopthread_size (M-elements) and the same reasoning: the
    * handshake costs a mutex, a condvar and an event-loop round trip, so it only
@@ -145,6 +166,7 @@ pdl_offload_eligible (pdl_trans *trans)
     PDL_Indx ncheck = iend - istart + 1; \
     PDL_BITFIELD_ENT had_badflag[PDL_BITFIELD_SIZE(ncheck)]; \
     PDL_BITFIELD_ZEROISE(had_badflag, ncheck); \
+    int __pdl_off_cancelled = 0; \
     for (i = istart; i < iend; i++) \
       if ((trans)->pdls[i] && (trans)->pdls[i]->state & PDL_BADVAL) \
         PDL_BITFIELD_SET(had_badflag, i-istart); \
@@ -152,14 +174,16 @@ pdl_offload_eligible (pdl_trans *trans)
     if (is_fwd && pdl_offload_eligible(trans)) { \
       struct pdl_offload_job job; \
       job.otrans = (trans); \
+      job.cancelled = 0; \
       job.err = pdl_offload_prepare_temps(trans); \
       if (!job.err.error) { \
-        pdl_offload_in_flight = 1; \
         /* the return value is done()'s immortal undef; the real result is in the \
-         * ndarrays and the status is in job.err */ \
+         * ndarrays and the status is in job.err.  This can croak - that is how the \
+         * backend delivers an exception aimed at the caller - so nothing here may \
+         * need undoing afterwards. */ \
         (void)multicore_offload(pdl_offload_work, &job, pdl_offload_done, NULL); \
-        pdl_offload_in_flight = 0; \
-        pdl_offload_ctx_flush(); /* anything the pthreads had to say */ \
+        pdl_offload_ctx_flush(&job.pctx); /* anything the pthreads had to say */ \
+        __pdl_off_cancelled = job.cancelled; \
       } \
       errcall(PDL_err, job.err); \
     } else \
@@ -175,6 +199,13 @@ pdl_offload_eligible (pdl_trans *trans)
       ) \
         pdl_propagate_badflag_dir(child, !!(child->state & PDL_BADVAL), is_fwd, 1); \
     } \
+    /* A cancelled transformation wrote part of its outputs and the loop above has \
+     * just marked them as agreeing with their parents.  They do not: put the flag \
+     * back, so the next read of one of them runs the transformation again instead \
+     * of handing out half an answer. */ \
+    if (__pdl_off_cancelled) \
+      for (i = istart; i < iend; i++) \
+        if ((trans)->pdls[i]) (trans)->pdls[i]->state |= PDL_PARENTDATACHANGED; \
   } while (0)
 #define READDATA(trans) VTABLE_OR_DEFAULT(PDL_ACCUMERROR, trans, 1, readdata)
 #define WRITEDATA(trans) VTABLE_OR_DEFAULT(PDL_ACCUMERROR, trans, 0, writebackdata)
@@ -233,6 +264,10 @@ pdl_error pdl__ensure_trans(pdl_trans *trans, int what, char inputs_only, int re
 {
   pdl_error PDL_err = {0, NULL, 0};
   PDLDEBUG_f(printf("pdl__ensure_trans %p what=", trans); pdl_dump_flags_fixspace(what, 0, PDL_FLAGS_PDL));
+  /* Somebody wants this after all - so a previous cancellation no longer stands.
+   * The destroy-time flush checks the flag before it gets here, so it is the reads
+   * that clear it. */
+  trans->flags &= ~PDL_ITRANS_CANCELLED;
   PDL_TR_CHKMAGIC(trans);
   pdl_transvtable *vtable = trans->vtable;
   if (trans->flags & PDL_ITRANS_ISAFFINE) {
@@ -517,7 +552,7 @@ pdl_error pdl_destroytransform(pdl_trans *trans, int ensure, int recurse_count)
   char ismutual = (trans->flags & PDL_ITRANS_DO_DATAFLOW_ANY);
   PDLDEBUG_f(printf("pdl_destroytransform %s=%p (ensure=%d ismutual=%d)\n",
     vtable->name,trans,ensure,(int)ismutual));
-  if (ensure)
+  if (ensure && !(trans->flags & PDL_ITRANS_CANCELLED))
     PDL_ACCUMERROR(PDL_err, pdl__ensure_trans(trans, ismutual ? 0 : PDL_PARENTDIMSCHANGED, 0, recurse_count+1));
   pdl *destbuffer[vtable->npdls];
   int ndest = 0;

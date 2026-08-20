@@ -114,11 +114,39 @@ void pdl_run_delayed_magic(void);
 
 /* Deferred barfing and warning when pthreading  */
 char pdl_pthread_main_thread(void);
-/* Around an offloaded transformation: the first two on the backend's worker
- * thread, the last back on the interpreter thread.  One at a time (see pdlapi.c) */
-void pdl_offload_ctx_install(void);
+
+/* We can only barf/warn from a thread that holds the interpreter, so a worker
+ * pthread complains into a buffer and the thread that spawned it reports the lot
+ * afterwards.  One of these holds those buffers.
+ *
+ * There is one per in-flight pdl_magic_thread_cast, plus one for an offloaded
+ * transformation, and a worker reaches its own through thread-local storage.  That
+ * is what lets a fan-out running on an offload backend's worker coexist with the
+ * interpreter thread, which is free to run another transformation meanwhile: each
+ * side complains to its own cast, and neither mistakes itself for the other. */
+typedef struct pdl_pthread_ctx {
+  char  *barf_msgs;
+  size_t barf_msgs_len;
+  char  *warn_msgs;
+  size_t warn_msgs_len;
+  char is_root;      /* an offloaded transformation, not a spawned worker: it may
+                      * not pthread_exit, so it barfs the ordinary way */
+  char defer_warns;  /* ... and it has no interpreter, so warnings travel home */
+  volatile int *cancel; /* the offload backend's advisory stop flag, or NULL.  An
+                      * offloaded transformation gets it from the backend and a cast
+                      * inside one copies it, so every pthread in the fan-out can
+                      * poll the same word (pdl_offload_cancel_ptr). */
+} pdl_pthread_ctx;
+
+/* Around an offloaded transformation.  The context belongs to the caller's frame;
+ * install and uninstall run on the backend's worker thread, flush back on the
+ * interpreter thread.  `cancel` is the backend's advisory stop flag (a
+ * perl_multicore_cancel_t *, spelled out so this header need not know about
+ * perlmulticore.h), or NULL. */
+void pdl_offload_ctx_install(pdl_pthread_ctx *ctx, volatile int *cancel);
 void pdl_offload_ctx_uninstall(void);
-void pdl_offload_ctx_flush(void);
+void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx);
+volatile int *pdl_offload_cancel_ptr(void);
 int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args);
 void pdl_pthread_realloc_vsnprintf(char **p, size_t *len, size_t extralen, const char *pat, va_list *args, char add_newline);
 void pdl_pthread_free(void *p);
