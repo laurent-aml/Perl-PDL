@@ -3,8 +3,88 @@
 #include "pdl.h"      /* Data structure declarations */
 #define PDL_IN_CORE
 #include "pdlcore.h"  /* Core declarations */
+#include "perlmulticore.h"
 
 extern Core PDL; /* for PDL_TYPENAME */
+
+/* --- running a transformation's C loop on a worker thread ------------------
+ *
+ * A transformation's readdata is pure C by PDL's own discipline: errors come back
+ * as pdl_error values rather than croaks (pdl_barf_if_error is only ever called
+ * from Core.xs), barf/warn from a non-main thread is buffered and replayed later
+ * (pdl_pthread_barf_or_warn), and perl-level magic is deferred to one controlled
+ * point (pdl_run_delayed_magic, called only from Core.xs).  That is the same
+ * property PDL already relies on for auto-pthreading, and it is what lets the loop
+ * run while the interpreter gets on with something else.
+ *
+ * Only the loop itself moves.  Everything around it that touches perl - allocating
+ * the outputs, propagating the bad-value flag - stays on the interpreter thread,
+ * outside the bracket, because on a threaded perl those go through the PerlHost
+ * layer and need an interpreter context a worker thread does not have.
+ *
+ * With no offload backend installed multicore_offload() runs the work inline, so
+ * this changes nothing for anyone who has not installed one. */
+
+/* member deliberately not called `trans`: this struct is used inside
+ * VTABLE_OR_DEFAULT, whose parameter of that name would be substituted into
+ * `job.trans` by the preprocessor. */
+struct pdl_offload_job { pdl_trans *otrans; pdl_error err; };
+
+
+static void
+pdl_offload_work (void *arg, const perl_multicore_work_ctx *ctx)
+{
+  struct pdl_offload_job *j = arg;
+  (void)ctx;                     /* cancellation is not offered yet */
+  j->err = j->otrans->vtable->readdata (j->otrans);
+}
+
+static SV *
+pdl_offload_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx)
+{
+  (void)arg; (void)ctx;
+  /* Nothing to marshal: a transformation writes into ndarrays that already exist,
+   * so the result is where the caller will look for it either way.  An immortal,
+   * so discarding multicore_offload's return value leaks nothing. */
+  return &PL_sv_undef;
+}
+
+/* Deliberately conservative.  Anything here that cannot be shown safe is left to
+ * run inline, which is always correct. */
+static int
+pdl_offload_eligible (pdl_trans *trans)
+{
+  pdl_transvtable *vtable = trans->vtable;
+  PDL_Indx i, biggest = 0, min_melems;
+
+  /* no backend: inline is what multicore_offload would do anyway, and the checks
+   * below are not worth paying for on every transformation */
+  if (!perlmulticore_offload_active ()) return 0;
+
+  if (!vtable->readdata) return 0;
+
+  /* the op declares itself unsafe to run in parallel (PP's NoPthread) */
+  if (vtable->flags & PDL_TRANS_NO_PARALLEL) return 0;
+
+  for (i = 0; i < vtable->npdls; i++) {
+    /* Temporaries exist to give each pthread its own scratch, and they are
+     * allocated from inside the loop - which would put an allocation, and so
+     * perl, on the worker thread.  Such ops stay inline. */
+    if (vtable->par_flags[i] & PDL_PARAM_ISTEMP) return 0;
+    if (trans->pdls[i] && trans->pdls[i]->nvals > biggest)
+      biggest = trans->pdls[i]->nvals;
+  }
+
+  /* Auto-pthreading already parallelises this op from the inside, and nesting the
+   * two would multiply the thread count.  Whoever asked for pthreads gets them. */
+  if (pdl_autopthread_targ > 1) return 0;
+
+  /* Same units as set_autopthread_size (M-elements) and the same reasoning: the
+   * handshake costs a mutex, a condvar and an event-loop round trip, so it only
+   * pays for work that is genuinely large. */
+  min_melems = pdl_autopthread_size > 0 ? pdl_autopthread_size : 1;
+  return (biggest >> 20) >= min_melems;
+}
 
 #define VTABLE_OR_DEFAULT(errcall, trans, is_fwd, func) \
   do { \
@@ -22,6 +102,16 @@ extern Core PDL; /* for PDL_TYPENAME */
       if ((trans)->pdls[i] && (trans)->pdls[i]->state & PDL_BADVAL) \
         PDL_BITFIELD_SET(had_badflag, i-istart); \
     PDLDEBUG_f(printf("had_badflag bitfield: 0b"); for (i = iend-istart; i >= 0; i--) { printf("%d", PDL_BITFIELD_ISSET(had_badflag, i)); } printf("\n");); \
+    if (is_fwd && pdl_offload_eligible(trans)) { \
+      struct pdl_offload_job job; \
+      job.otrans = (trans); \
+      pdl_error zero = {0, NULL, 0}; \
+      job.err = zero; \
+      /* the return value is done()'s immortal undef; the real result is in the \
+       * ndarrays and the status is in job.err */ \
+      (void)multicore_offload(pdl_offload_work, &job, pdl_offload_done, NULL); \
+      errcall(PDL_err, job.err); \
+    } else \
     errcall(PDL_err, (vtable->func \
       ? vtable->func(trans) \
       : pdl_make_error(PDL_EUSERERROR, "%s: " #func " called with no vtable entry", vtable->name))); \
