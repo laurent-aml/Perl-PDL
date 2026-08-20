@@ -46,6 +46,9 @@ struct pdl_offload_job {
                            * job does, which is as long as the work runs. */
 };
 
+/* PDL_OFFLOAD_DEBUG=1 traces why a transformation was or was not offloaded */
+static int pdl_offload_debug = -1;
+
 static void
 pdl_offload_work (void *arg, const perl_multicore_work_ctx *ctx)
 {
@@ -144,14 +147,24 @@ pdl_offload_eligible (pdl_trans *trans)
   pdl_transvtable *vtable = trans->vtable;
   PDL_Indx i, biggest = 0, min_melems;
 
+  if (pdl_offload_debug < 0) {
+    const char *e = getenv ("PDL_OFFLOAD_DEBUG");
+    pdl_offload_debug = e && *e && strcmp (e, "0");
+  }
+
+#define PDL_OFF_NO(why) do { \
+    if (pdl_offload_debug) fprintf (stderr, "pdl offload: %s declined: %s\n", vtable->name, why); \
+    return 0; \
+  } while (0)
+
   /* no backend: inline is what multicore_offload would do anyway, and the checks
    * below are not worth paying for on every transformation */
-  if (!perlmulticore_offload_active ()) return 0;
+  if (!perlmulticore_offload_active ()) PDL_OFF_NO("no backend installed");
 
-  if (!vtable->readdata) return 0;
+  if (!vtable->readdata) PDL_OFF_NO("no readdata");
 
   /* the op declares itself unsafe to run in parallel (PP's NoPthread) */
-  if (vtable->flags & PDL_TRANS_NO_PARALLEL) return 0;
+  if (vtable->flags & PDL_TRANS_NO_PARALLEL) PDL_OFF_NO("op is NoPthread");
 
   for (i = 0; i < vtable->npdls; i++)
     if (trans->pdls[i] && trans->pdls[i]->nvals > biggest)
@@ -165,7 +178,11 @@ pdl_offload_eligible (pdl_trans *trans)
    * handshake costs a mutex, a condvar and an event-loop round trip, so it only
    * pays for work that is genuinely large. */
   min_melems = pdl_autopthread_size > 0 ? pdl_autopthread_size : 1;
-  return (biggest >> 20) >= min_melems;
+  if ((biggest >> 20) < min_melems) PDL_OFF_NO("below the size threshold");
+
+  if (pdl_offload_debug) fprintf (stderr, "pdl offload: %s offloading\n", vtable->name);
+  return 1;
+#undef PDL_OFF_NO
 }
 
 #define VTABLE_OR_DEFAULT(errcall, trans, is_fwd, func) \
