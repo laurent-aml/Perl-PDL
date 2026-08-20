@@ -437,6 +437,18 @@ void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx) {
   }
 }
 
+/* Anything the transformation barfed with no cast around it to collect it: a worker
+ * cannot raise, so it comes back as the value the transformation returns. */
+pdl_error pdl_offload_ctx_error(pdl_pthread_ctx *ctx) {
+  pdl_error PDL_err = {0, NULL, 0};
+  if (!ctx->barf_msgs_len) return PDL_err;
+  ctx->barf_msgs_len = 0;
+  PDL_err = pdl_make_error(PDL_EUSERERROR, "%s", ctx->barf_msgs);
+  free(ctx->barf_msgs);
+  ctx->barf_msgs = NULL;
+  return PDL_err;
+}
+
 /* For the path where the offloading frame is being destroyed instead of resumed:
  * the messages are dropped rather than replayed, because replaying means warning
  * in the middle of an exception being delivered, and a __WARN__ handler that dies
@@ -466,7 +478,7 @@ int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args)
 
 	/* Don't do anything if we are in the main pthread */
 	pdl_pthread_ctx *ctx = pdl_pthread_ctx_get();
-	if (!ctx || ctx->is_root) return 0;
+	if (!ctx) return 0;
 
 	if(iswarn)
 	{
@@ -489,6 +501,13 @@ int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args)
 		return(1);
 	}
 
+	/* An offloaded transformation is not on a thread of PDL's making - the offload
+	 * backend owns it and is waiting for it to come back - so exiting it is not
+	 * ours to do.  Report as handled; pdl_offload_ctx_error turns what was said
+	 * into the error value the transformation returns.  The loop does run on to
+	 * its end, which an ordinary barf would not. */
+	if (ctx->is_root) return 1;
+
 	/* Exit the current pthread. Since this was a barf call, and we should be halting execution */
 	pthread_exit(NULL);
 	return 0;
@@ -504,11 +523,15 @@ void pdl_pthread_realloc_vsnprintf(char **p, size_t *len, size_t extralen, const
 #ifdef WIN32
 #undef realloc
 #endif
+  /* Write over the terminator left by the last message, not after it: appending
+   * past it left everything but the first message unreachable to the "%s" that
+   * eventually reports the buffer. */
+  size_t start = *len ? *len - 1 : 0;
   if (add_newline) extralen += 1;
   extralen += 1; /* +1 for '\0' at end */
-  *p = realloc(*p, *len + extralen);
-  vsnprintf(*p + *len, extralen, pat, *args);
-  *len += extralen; /* update the length-so-far, includes '\0' */
+  *p = realloc(*p, start + extralen);
+  vsnprintf(*p + start, extralen, pat, *args);
+  *len = start + extralen; /* the length so far, including the '\0' */
   if (add_newline) (*p)[*len-2] = '\n';
   (*p)[*len-1] = '\0';
   pthread_mutex_unlock( &mutex );
@@ -590,6 +613,9 @@ void pdl_offload_ctx_install(pdl_pthread_ctx *ctx, volatile int *cancel) {
 void pdl_offload_ctx_uninstall(void) {}
 void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx) { (void)ctx; }
 void pdl_offload_ctx_discard(pdl_pthread_ctx *ctx) { (void)ctx; }
+pdl_error pdl_offload_ctx_error(pdl_pthread_ctx *ctx) {
+  pdl_error PDL_err = {0, NULL, 0}; (void)ctx; return PDL_err;
+}
 volatile int *pdl_offload_cancel_ptr(void) { return NULL; }
 int pdl_magic_get_thread(pdl *it) {return 0;}
 pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans *t, pdl_broadcast *broadcast) {pdl_error PDL_err = {0,NULL,0}; return PDL_err;}

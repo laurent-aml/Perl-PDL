@@ -60,6 +60,11 @@ pdl_offload_work (void *arg, const perl_multicore_work_ctx *ctx)
   j->err = j->otrans->vtable->readdata (j->otrans);
   pdl_offload_ctx_uninstall ();
 
+  /* A barf with no pthread fan-out around it to collect it lands in the context
+   * instead, since raising it here would mean calling perl. */
+  if (!j->err.error)
+    j->err = pdl_offload_ctx_error (&j->pctx);
+
   if (cancel && *cancel)
     {
       j->cancelled = 1;

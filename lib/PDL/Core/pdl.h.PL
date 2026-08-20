@@ -657,13 +657,15 @@ typedef struct pdl_slice_args {
     register PDL_Indx *__offsp = PDL->get_threadoffsp(&(brc)); \
     if (!__offsp ) return PDL->make_error_simple(PDL_EFATAL, "Error in get_threadoffsp"); \
     /* NULL unless this loop is running inside an offloaded transformation that its \
-     * caller can cancel.  Read once per chunk and tested every 256 turns of the \
-     * tight loop below - and on its first turn, so every row polls at least once. \
-     * Costs nothing measurable: the pointer is loop-invariant, so the common NULL \
-     * case leaves the loop as it was.  What it cannot reach is work inside the op's \
-     * own body, so an op with one big core dimension and nothing to broadcast over \
-     * has no boundary to stop at.  The caller turns this into an error - what is \
-     * left behind here is a partial result. */ \
+     * caller can cancel.  Read once per chunk, tested on every turn of the tight \
+     * loop below, since one turn runs the whole of the op's body and there is no \
+     * count of turns that bounds a time: an op can have four of them and take a \
+     * second.  So the latency is one body, which is as good as it gets from out \
+     * here - work inside the body is beyond reach, and an op with one big core \
+     * dimension and nothing to broadcast over has no boundary at all.  Costs \
+     * nothing measurable either way: the pointer is loop-invariant, so the usual \
+     * NULL case leaves the loop as the compiler had it.  The caller turns a stopped \
+     * loop into an error - what is left behind here is a partial result. */ \
     volatile int *__cancelp = PDL->offload_cancel_ptr(); \
     /* incs are each pdl's stride, declared at func start */ \
     /* offs are each pthread's starting offset into each pdl */ \
@@ -680,7 +682,7 @@ typedef struct pdl_slice_args {
         __tind0++ \
         PDL_EXPAND ptrStep3 \
       ) { \
-        if (__cancelp && !(__tind0 & 255) && *__cancelp) return PDL_err; \
+        if (__cancelp && *__cancelp) return PDL_err; \
         /* This is the tightest loop. Make sure inside is optimal. */
 #define PDL_BROADCASTLOOP_END(brc, ptrStep1) \
       } \

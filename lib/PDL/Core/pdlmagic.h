@@ -147,6 +147,7 @@ void pdl_offload_ctx_install(pdl_pthread_ctx *ctx, volatile int *cancel);
 void pdl_offload_ctx_uninstall(void);
 void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx);
 void pdl_offload_ctx_discard(pdl_pthread_ctx *ctx); /* ... or drop them unread */
+pdl_error pdl_offload_ctx_error(pdl_pthread_ctx *ctx); /* what it barfed, as a value */
 volatile int *pdl_offload_cancel_ptr(void);
 int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args);
 void pdl_pthread_realloc_vsnprintf(char **p, size_t *len, size_t extralen, const char *pat, va_list *args, char add_newline);
