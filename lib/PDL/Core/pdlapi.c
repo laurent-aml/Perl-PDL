@@ -122,6 +122,15 @@ pdl_offload_prepare_temps (pdl_trans *trans)
   return PDL_err;
 }
 
+/* Scope-exit form of pdl_offload_ctx_discard, for the one path that cannot reach
+ * the flush: the backend delivers an exception to the caller, and control never
+ * returns to the frame the context lives in. */
+static void
+pdl_offload_ctx_unwind (pTHX_ void *p)
+{
+  pdl_offload_ctx_discard ((pdl_pthread_ctx *)p);
+}
+
 /* Deliberately conservative.  Anything here that cannot be shown safe is left to
  * run inline, which is always correct. */
 static int
@@ -177,12 +186,17 @@ pdl_offload_eligible (pdl_trans *trans)
       job.cancelled = 0; \
       job.err = pdl_offload_prepare_temps(trans); \
       if (!job.err.error) { \
+        dTHX; \
+        /* The call can croak - that is how the backend delivers an exception aimed \
+         * at the caller - and then the flush below is never reached, so whatever \
+         * the pthreads left in the context needs an owner on that path too. */ \
+        ENTER; \
+        SAVEDESTRUCTOR_X(pdl_offload_ctx_unwind, &job.pctx); \
         /* the return value is done()'s immortal undef; the real result is in the \
-         * ndarrays and the status is in job.err.  This can croak - that is how the \
-         * backend delivers an exception aimed at the caller - so nothing here may \
-         * need undoing afterwards. */ \
+         * ndarrays and the status is in job.err */ \
         (void)multicore_offload(pdl_offload_work, &job, pdl_offload_done, NULL); \
         pdl_offload_ctx_flush(&job.pctx); /* anything the pthreads had to say */ \
+        LEAVE; \
         __pdl_off_cancelled = job.cancelled; \
       } \
       errcall(PDL_err, job.err); \

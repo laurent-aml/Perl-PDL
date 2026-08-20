@@ -437,6 +437,15 @@ void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx) {
   }
 }
 
+/* For the path where the offloading frame is being destroyed instead of resumed:
+ * the messages are dropped rather than replayed, because replaying means warning
+ * in the middle of an exception being delivered, and a __WARN__ handler that dies
+ * there would replace the exception with its own. */
+void pdl_offload_ctx_discard(pdl_pthread_ctx *ctx) {
+  free(ctx->warn_msgs); ctx->warn_msgs = NULL; ctx->warn_msgs_len = 0;
+  free(ctx->barf_msgs); ctx->barf_msgs = NULL; ctx->barf_msgs_len = 0;
+}
+
 char pdl_pthread_main_thread(void) {
   pdl_pthread_ctx *ctx = pdl_pthread_ctx_get();
   /* An offloaded transformation counts as the main thread: it must not exit the
@@ -580,6 +589,7 @@ void pdl_offload_ctx_install(pdl_pthread_ctx *ctx, volatile int *cancel) {
 }
 void pdl_offload_ctx_uninstall(void) {}
 void pdl_offload_ctx_flush(pdl_pthread_ctx *ctx) { (void)ctx; }
+void pdl_offload_ctx_discard(pdl_pthread_ctx *ctx) { (void)ctx; }
 volatile int *pdl_offload_cancel_ptr(void) { return NULL; }
 int pdl_magic_get_thread(pdl *it) {return 0;}
 pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans *t, pdl_broadcast *broadcast) {pdl_error PDL_err = {0,NULL,0}; return PDL_err;}
