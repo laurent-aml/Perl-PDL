@@ -3,8 +3,213 @@
 #include "pdl.h"      /* Data structure declarations */
 #define PDL_IN_CORE
 #include "pdlcore.h"  /* Core declarations */
+#include "perlmulticore.h"
+
+#ifndef PDL_HAVE_MULTICORE_OFFLOAD
+/* This perl has no multicore_offload hook (Makefile.PL probes for it), so there is
+ * nothing to hand a transformation to.  The types above still come from the header,
+ * which is self-contained; what is missing is the interpreter's side of the
+ * rendezvous, and a module cannot supply that.
+ *
+ * Everything below is written against the primitive, so rather than #ifdef the call
+ * sites - one of which is inside a macro, where that is not possible - the
+ * synchronous form is defined here to do what it does with no backend installed:
+ * run the work and then done (), right here.  pdl_offload_eligible () returns 0
+ * without the hook anyway, so this is a compile-time fallback, not a runtime one. */
+static SV *
+pdl_offload_no_hook (pTHX_ perl_multicore_work_t work, void *work_arg,
+                     perl_multicore_done_t done, void *done_arg)
+{
+  perl_multicore_work_ctx work_ctx;
+  perl_multicore_done_ctx done_ctx;
+
+  work_ctx.size = sizeof (work_ctx); work_ctx.cancel = NULL;
+  work (work_arg, &work_ctx);
+
+  done_ctx.size = sizeof (done_ctx);
+  done_ctx.cancelled = done_ctx.dropped = 0;
+
+  return done (aTHX_ done_arg, &done_ctx);
+}
+
+#define multicore_offload_sync(work, work_arg, done, done_arg) \
+  pdl_offload_no_hook (aTHX_ (work), (work_arg), (done), (done_arg))
+#endif
 
 extern Core PDL; /* for PDL_TYPENAME */
+
+/* --- running a transformation's C loop on a worker thread ------------------
+ *
+ * A transformation's readdata is pure C by PDL's own discipline: errors come back
+ * as pdl_error values rather than croaks (pdl_barf_if_error is only ever called
+ * from Core.xs), barf/warn from a non-main thread is buffered and replayed later
+ * (pdl_pthread_barf_or_warn), and perl-level magic is deferred to one controlled
+ * point (pdl_run_delayed_magic, called only from Core.xs).  That is the same
+ * property PDL already relies on for auto-pthreading, and it is what lets the loop
+ * run while the interpreter gets on with something else.
+ *
+ * Only the loop itself moves.  Everything around it that touches perl - allocating
+ * the outputs, propagating the bad-value flag - stays on the interpreter thread,
+ * outside the bracket, because on a threaded perl those go through the PerlHost
+ * layer and need an interpreter context a worker thread does not have.
+ *
+ * Auto-pthreading is not an alternative to this but a layer under it: the worker
+ * thread runs the broadcast loop, and the loop fans itself out over pthreads and
+ * joins them, so a transformation gets its cores and the interpreter is free at the
+ * same time.  Two things have to be arranged for that to hold, both here: the
+ * per-pthread scratch ndarrays are made physical before we hand over
+ * (pdl_broadcast_prepare_temps), since allocating one goes through perl; and the
+ * warnings those pthreads defer are replayed after we get back
+ * (pdl_offload_ctx_flush), for the same reason.
+ *
+ * With no offload backend installed the work runs inline, so this changes nothing
+ * for anyone who has not installed one. */
+
+/* member deliberately not called `trans`: this struct is used inside
+ * VTABLE_OR_DEFAULT, whose parameter of that name would be substituted into
+ * `job.trans` by the preprocessor. */
+struct pdl_offload_job {
+  pdl_trans *otrans;
+  pdl_error err;
+  int cancelled;
+  int ran;                /* the worker got as far as calling readdata.  A
+                           * cancellation can reach a job before the worker does,
+                           * and then nothing runs at all - which is not a whole
+                           * answer either, and is not otherwise distinguishable
+                           * from one, since `cancelled` below is only set by a poll
+                           * that actually happened. */
+  pdl_pthread_ctx pctx;   /* the worker's context: ours, because the worker cannot
+                           * make one without calling perl.  Lives as long as this
+                           * job does, which is as long as the work runs. */
+};
+
+static void
+pdl_offload_work (void *arg, const perl_multicore_work_ctx *ctx)
+{
+  struct pdl_offload_job *j = arg;
+  /* The context is where the backend leaves the advisory stop flag; it also has to
+   * reach the pthreads a fan-out spawns, which is what the installed context is
+   * for.  And there is no interpreter on this thread, so warnings that fan-out
+   * defers must not be reported here either - they come back with us. */
+  volatile int *cancel = ctx && ctx->size >= sizeof (*ctx) ? ctx->cancel : NULL;
+
+  j->ran = 1;
+  pdl_offload_ctx_install (&j->pctx, cancel);
+  j->err = j->otrans->vtable->readdata (j->otrans);
+  pdl_offload_ctx_uninstall ();
+
+  /* A barf with no pthread fan-out around it to collect it lands in the context
+   * instead, since raising it here would mean calling perl. */
+  if (!j->err.error)
+    j->err = pdl_offload_ctx_error (&j->pctx);
+
+  if (cancel && *cancel)
+    {
+      j->cancelled = 1;
+
+      /* Mark the transformation itself, not just the job: if the backend delivers
+       * an exception to the caller, control never comes back here, and the frames
+       * being unwound would otherwise flush this very transformation on their way
+       * out (pdl_destroytransform).  Written from the worker, but only the
+       * suspended caller owns this trans, and only after this does anyone read it. */
+      j->otrans->flags |= PDL_ITRANS_CANCELLED;
+
+      /* The loop stopped in the middle, so whatever is in the outputs is partial.
+       * Say so: this is the caller's only sign that the values are not the ones it
+       * asked for.  An error the transformation raised on its own says more, so it
+       * wins. */
+      if (!j->err.error)
+        j->err = pdl_make_error (PDL_EUSERERROR, "%s: cancelled",
+                                 j->otrans->vtable->name);
+    }
+}
+
+static SV *
+pdl_offload_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx)
+{
+  (void)arg; (void)ctx;
+  /* Nothing to marshal: a transformation writes into ndarrays that already exist,
+   * so the result is where the caller will look for it either way.  An immortal,
+   * which the hand-over rule allows and which costs nothing to release. */
+  return &PL_sv_undef;
+}
+
+/* Scope-exit form of pdl_offload_ctx_discard, for the one path that cannot reach
+ * the flush: the backend delivers an exception to the caller, and control never
+ * returns to the frame the context lives in. */
+static void
+pdl_offload_ctx_unwind (pTHX_ void *p)
+{
+  pdl_offload_ctx_discard ((pdl_pthread_ctx *)p);
+}
+
+/* Deliberately conservative.  Anything here that cannot be shown safe is left to
+ * run inline, which is always correct. */
+static int
+pdl_offload_eligible (pdl_trans *trans)
+{
+  pdl_transvtable *vtable = trans->vtable;
+  PDL_Indx i, biggest = 0, min_melems;
+
+#ifndef PDL_HAVE_MULTICORE_OFFLOAD
+  /* no hook in this perl: nothing to offload to, and PL_multicore_offload - which
+   * the probe below reads - does not exist here */
+  PERL_UNUSED_ARG (trans);
+  return 0;
+#else
+  /* no backend: inline is what multicore_offload would do anyway, and the checks
+   * below are not worth paying for on every transformation */
+  if (!perlmulticore_offload_active ()) return 0;
+
+  if (!vtable->readdata) return 0;
+
+  /* the op declares itself unsafe to run in parallel (PP's NoPthread) */
+  if (vtable->flags & PDL_TRANS_NO_PARALLEL) return 0;
+
+  for (i = 0; i < vtable->npdls; i++)
+    if (trans->pdls[i] && trans->pdls[i]->nvals > biggest)
+      biggest = trans->pdls[i]->nvals;
+
+  /* Auto-pthreading composes with offloading rather than competing with it: the
+   * worker fans the broadcast loop out over pthreads and joins them, so the op
+   * still gets its cores while the interpreter is free. */
+
+  /* Same units as set_autopthread_size (M-elements) and the same reasoning: the
+   * handshake costs a mutex, a condvar and an event-loop round trip, so it only
+   * pays for work that is genuinely large. */
+  min_melems = pdl_autopthread_size > 0 ? pdl_autopthread_size : 1;
+  return (biggest >> 20) >= min_melems;
+#endif
+}
+
+/* What has to happen after the data has moved: the children now agree with their
+ * parents, and a badflag that changed has to be propagated.  A function rather than
+ * part of the macro below because the asynchronous entry point cannot do it there -
+ * by the time it would run, the work has not started.  It happens in done ()
+ * instead, which is the same place in the sequence, just not the same frame. */
+static void
+pdl_offload_finish(pdl_trans *trans, int is_fwd, PDL_Indx istart, PDL_Indx iend,
+                   PDL_BITFIELD_ENT *had_badflag, int cancelled)
+{
+  PDL_Indx i;
+
+  for (i = istart; i < iend; i++) {
+    pdl *child = trans->pdls[i];
+    if (!child) continue;
+    PDLDEBUG_f(printf("VTOD child=%p turning off datachanged, before=", child); pdl_dump_flags_fixspace(child->state, 0, PDL_FLAGS_PDL));
+    if (is_fwd) child->state &= ~PDL_PARENTDATACHANGED;
+    if (!!(child->state & PDL_BADVAL) != !!PDL_BITFIELD_ISSET(had_badflag, i-istart))
+      pdl_propagate_badflag_dir(child, !!(child->state & PDL_BADVAL), is_fwd, 1);
+  }
+
+  /* A cancelled transformation wrote part of its outputs and the loop above has
+   * just marked them as agreeing with their parents.  They do not: put the flag
+   * back, so the next read of one of them runs the transformation again instead
+   * of handing out half an answer. */
+  if (cancelled)
+    for (i = istart; i < iend; i++)
+      if (trans->pdls[i]) trans->pdls[i]->state |= PDL_PARENTDATACHANGED;
+}
 
 #define VTABLE_OR_DEFAULT(errcall, trans, is_fwd, func) \
   do { \
@@ -18,22 +223,47 @@ extern Core PDL; /* for PDL_TYPENAME */
     PDL_Indx ncheck = iend - istart + 1; \
     PDL_BITFIELD_ENT had_badflag[PDL_BITFIELD_SIZE(ncheck)]; \
     PDL_BITFIELD_ZEROISE(had_badflag, ncheck); \
+    int __pdl_off_cancelled = 0; \
     for (i = istart; i < iend; i++) \
       if ((trans)->pdls[i] && (trans)->pdls[i]->state & PDL_BADVAL) \
         PDL_BITFIELD_SET(had_badflag, i-istart); \
     PDLDEBUG_f(printf("had_badflag bitfield: 0b"); for (i = iend-istart; i >= 0; i--) { printf("%d", PDL_BITFIELD_ISSET(had_badflag, i)); } printf("\n");); \
+    if (is_fwd && pdl_offload_eligible(trans)) { \
+      struct pdl_offload_job job; \
+      job.otrans = (trans); \
+      job.cancelled = 0; \
+      job.ran = 0; \
+      /* the temporaries the fan-out inside the work will write into, allocated \
+       * here because doing it there would mean calling perl (pdlbroadcast.c) */ \
+      job.err = pdl_broadcast_prepare_temps(&(trans)->broadcast, (trans)); \
+      if (!job.err.error) { \
+        dTHX; \
+        /* The call can croak - that is how the backend delivers an exception aimed \
+         * at the caller - and then the flush below is never reached, so whatever \
+         * the pthreads left in the context needs an owner on that path too. */ \
+        ENTER; \
+        SAVEDESTRUCTOR_X(pdl_offload_ctx_unwind, &job.pctx); \
+        /* The synchronous form, which waits for the offload's handle before it \
+         * returns.  Everything below depends on that: job.err and job.cancelled \
+         * are written by the worker, job.pctx is filled by the pthreads inside \
+         * the work, and the job itself is an automatic in this frame.  It is also \
+         * why the job may stay here rather than being heap-allocated - the rule \
+         * in perlmulticore.h being to keep it on the frame exactly when you wait \
+         * on the handle before returning. \
+         * The value is done()'s immortal undef; the real result is in the \
+         * ndarrays and the status is in job.err. */ \
+        SvREFCNT_dec(multicore_offload_sync(pdl_offload_work, &job, \
+                                           pdl_offload_done, NULL)); \
+        pdl_offload_ctx_flush(&job.pctx); /* anything the pthreads had to say */ \
+        LEAVE; \
+        __pdl_off_cancelled = job.cancelled; \
+      } \
+      errcall(PDL_err, job.err); \
+    } else \
     errcall(PDL_err, (vtable->func \
       ? vtable->func(trans) \
       : pdl_make_error(PDL_EUSERERROR, "%s: " #func " called with no vtable entry", vtable->name))); \
-    for (i = istart; i < iend; i++) { \
-      pdl *child = (trans)->pdls[i]; \
-      PDLDEBUG_f(printf("VTOD " #func " child=%p turning off datachanged, before=", child); pdl_dump_flags_fixspace(child->state, 0, PDL_FLAGS_PDL)); \
-      if (is_fwd) child->state &= ~PDL_PARENTDATACHANGED; \
-      if (child && \
-        !!(child->state & PDL_BADVAL) != !!PDL_BITFIELD_ISSET(had_badflag, i-istart) \
-      ) \
-        pdl_propagate_badflag_dir(child, !!(child->state & PDL_BADVAL), is_fwd, 1); \
-    } \
+    pdl_offload_finish(trans, is_fwd, istart, iend, had_badflag, __pdl_off_cancelled); \
   } while (0)
 #define READDATA(trans) VTABLE_OR_DEFAULT(PDL_ACCUMERROR, trans, 1, readdata)
 #define WRITEDATA(trans) VTABLE_OR_DEFAULT(PDL_ACCUMERROR, trans, 0, writebackdata)
@@ -88,13 +318,26 @@ extern Core PDL;
 pdl_error pdl__make_physical_recprotect(pdl *it, int recurse_count);
 pdl_error pdl__make_physvaffine_recprotect(pdl *it, int recurse_count);
 /* Make sure transformation is done */
-pdl_error pdl__ensure_trans(pdl_trans *trans, int what, char inputs_only, int recurse_count)
+/* Everything pdl__ensure_trans does before the data moves: the parents made
+ * physical, the change flags accumulated, and the dims redone.  Split out because
+ * the asynchronous entry point below has to do exactly this and then NOT read the
+ * data here.  *flag_out is what decides whether there is anything to read at all;
+ * *handled says the affine short-cut has already done everything. */
+static pdl_error
+pdl__ensure_trans_prepare(pdl_trans *trans, int what, char inputs_only,
+                          int recurse_count, int *flag_out, char *handled)
 {
   pdl_error PDL_err = {0, NULL, 0};
-  PDLDEBUG_f(printf("pdl__ensure_trans %p what=", trans); pdl_dump_flags_fixspace(what, 0, PDL_FLAGS_PDL));
+  *flag_out = 0;
+  *handled = 0;
+  /* Somebody wants this after all - so a previous cancellation no longer stands.
+   * The destroy-time flush checks the flag before it gets here, so it is the reads
+   * that clear it. */
+  trans->flags &= ~PDL_ITRANS_CANCELLED;
   PDL_TR_CHKMAGIC(trans);
   pdl_transvtable *vtable = trans->vtable;
   if (trans->flags & PDL_ITRANS_ISAFFINE) {
+    *handled = 1;
     if (!(vtable->nparents == 1 && vtable->npdls == 2))
       return pdl_make_error_simple(PDL_EUSERERROR, "Affine trans other than 1 input 1 output");
     return pdl__make_physical_recprotect(trans->pdls[1], recurse_count+1);
@@ -113,6 +356,236 @@ pdl_error pdl__ensure_trans(pdl_trans *trans, int what, char inputs_only, int re
   PDLDEBUG_f(printf("pdl__ensure_trans after accum, par_pvaf=%"IND_FLAG" flag=", par_pvaf); pdl_dump_flags_fixspace(flag, 0, PDL_FLAGS_PDL));
   if (par_pvaf || flag & PDL_PARENTDIMSCHANGED)
     REDODIMS(PDL_RETERROR, trans); /* CORE21 change to make_physdims_recetc */
+  *flag_out = flag;
+  return PDL_err;
+}
+
+/* ===========================================================================
+ * The asynchronous entry point
+ *
+ * Everything above offloads and waits, which is what an ordinary `$b = $a->sumover`
+ * wants: the interpreter is free while the op runs, and nothing in PDL's interface
+ * changes.  A caller that wants to hold the operation instead - to run several at
+ * once, or to `await` it from a stackless program - needs the offload's HANDLE, and
+ * that changes three things.
+ *
+ * The job cannot live on the frame, since the frame returns first (the rule in
+ * perlmulticore.h: keep it on the frame exactly when you wait before returning).
+ * Nor can the post-work happen at the call: it belongs after the loop, which by
+ * then has not started, so it moves into done () - the same place in the sequence,
+ * a different frame.  And every participating ndarray has to be retained, because
+ * with the handle out in the open the caller may drop its references at any moment,
+ * and destroying one of these would take the transformation with it while the
+ * worker is still reading it.
+ *
+ * What it does NOT need is a third evaluation path: dataflow already sets a
+ * transformation up without running it, so an ndarray with a pending parent
+ * transformation is exactly the input this wants.
+ *
+ * One thing it does not do: stop the caller mutating the inputs while the worker
+ * reads them.  A suspended green thread cannot do that - it is not running - but an
+ * awaiting stackless caller is, so this wants a guard that makes such a mutation
+ * fail loudly.  Not written yet.
+ * ======================================================================== */
+
+#ifndef PDL_HAVE_MULTICORE_OFFLOAD
+/* Without the hook there is no handle to hand back, and no way to make one: the
+ * class comes from the interpreter too.  Refuse, rather than pretend. */
+pdl_error
+pdl_make_physical_async (pTHX_ pdl *it, SV *itsv, SV **handle_out)
+{
+  PERL_UNUSED_ARG (it);
+  PERL_UNUSED_ARG (itsv);
+
+  *handle_out = NULL;
+
+  return pdl_make_error_simple (PDL_EUSERERROR,
+    "make_physical_async: this perl has no multicore_offload hook");
+}
+#else
+struct pdl_offload_async_job {
+  struct pdl_offload_job job;      /* FIRST: pdl_offload_work () gets this pointer */
+  SV *value;                       /* what the handle resolves to: the ndarray */
+  SV **retained;                   /* the participating ndarrays, kept alive */
+  int nretained;
+  PDL_BITFIELD_ENT *had_badflag;   /* recorded before the work, read after it */
+};
+
+static void
+pdl_offload_async_free (pTHX_ struct pdl_offload_async_job *aj)
+{
+  int i;
+
+  for (i = 0; i < aj->nretained; i++)
+    SvREFCNT_dec (aj->retained[i]);
+
+  Safefree (aj->retained);
+  Safefree (aj->had_badflag);
+  Safefree (aj);
+}
+
+/* Runs holding the interpreter once the work is over.  Everything the synchronous
+ * path does after the call happens here instead, and an error the transformation
+ * raised is croaked rather than returned: the backend turns that into the handle's
+ * failure, so it reaches whoever asks for the value.
+ *
+ * This also runs when the handle was dropped while the work was still going, which
+ * is the only way the job gets freed on that path (there is no frame left to own
+ * it).  Then `dropped` is set: there is nobody to hand a value or an error to, and
+ * the cancellation that stopped the work is not news to anyone. */
+static SV *
+pdl_offload_async_done (pTHX_ void *arg, const perl_multicore_done_ctx *ctx)
+{
+  struct pdl_offload_async_job *aj = arg;
+  pdl_trans *trans = aj->job.otrans;
+  pdl_transvtable *vtable = trans->vtable;
+  pdl_error err = aj->job.err;
+  SV *value = aj->value;
+  int have_ctx = ctx && ctx->size >= sizeof (*ctx);
+  int requested = have_ctx && ctx->cancelled;   /* someone asked us to stop     */
+  int truncated = aj->job.cancelled;            /* and a poll acted on it       */
+  int ran = aj->job.ran;                        /* the loop was entered at all  */
+  int cancelled = requested || truncated;
+  int dropped = have_ctx && ctx->dropped;
+
+  pdl_offload_finish (trans, 1, vtable->nparents, vtable->npdls,
+                      aj->had_badflag, cancelled);
+  pdl_offload_ctx_flush (&aj->job.pctx);   /* anything the pthreads had to say */
+
+  pdl_offload_async_free (aTHX_ aj);
+
+  /* Cancellation that actually cost us the result raises the exception every
+   * offloading module raises for that, so a caller can tell it from any other
+   * failure without matching on the message.  `completed` is what says whether the
+   * loop got to the end: a cancellation can reach a job before the worker does, and
+   * then nothing ran at all - which is not a whole answer either.
+   *
+   * Nothing is attached to it.  The outputs are part-written or untouched, and
+   * pdl_offload_finish () has just marked them so that reading one computes it
+   * again; offering them as a partial result would be a lie. */
+  if (!dropped && requested && (truncated || !ran))
+    {
+      SV *exc = multicore_offload_cancelled (NULL,
+                  err.error ? err.message : "offload cancelled before it ran");
+
+      if (err.needs_free)
+        pdl_error_free (err);
+
+      SvREFCNT_dec (value);
+      croak_sv (exc);
+    }
+
+  if (err.error && !dropped)
+    {
+      SvREFCNT_dec (value);
+      pdl_barf_if_error (err);             /* croaks; becomes the handle's failure */
+    }
+
+  if (dropped)
+    {
+      if (err.needs_free)
+        pdl_error_free (err);
+
+      SvREFCNT_dec (value);
+
+      return &PL_sv_undef;
+    }
+
+  return value;                            /* hands over the reference we made */
+}
+
+/* Offload the pending transformation of `it` and hand back the handle, without
+ * waiting for it.  `itsv` is the ndarray as the caller passed it, and the handle
+ * resolves to a copy of it - so `await`ing or `get`ting the handle yields the
+ * ndarray, by then physical.
+ *
+ * There is always a handle: an ndarray with nothing pending, or one whose
+ * transformation may not be offloaded (affine, declines to parallelise, too small
+ * to be worth a worker) is made physical here and comes back already resolved.  A
+ * caller must not have to ask which happened. */
+pdl_error
+pdl_make_physical_async (pTHX_ pdl *it, SV *itsv, SV **handle_out)
+{
+  pdl_error PDL_err = {0, NULL, 0};
+  pdl_trans *trans = it->trans_parent;
+  pdl_transvtable *vtable;
+  struct pdl_offload_async_job *aj;
+  PDL_Indx i, istart, iend, ncheck;
+  int flag;
+  char handled;
+
+  *handle_out = NULL;
+
+  if (!trans || !(it->state & PDL_ANYCHANGED))
+    goto inline_it;                        /* nothing pending */
+
+  PDL_RETERROR (PDL_err, pdl__ensure_trans_prepare (trans, 0, 1, 0, &flag, &handled));
+
+  if (handled || !(flag & PDL_ANYCHANGED) || !pdl_offload_eligible (trans))
+    goto inline_it;                        /* the dims are done; the loop is not */
+
+  vtable = trans->vtable;
+  istart = vtable->nparents;
+  iend   = vtable->npdls;
+  ncheck = iend - istart + 1;
+
+  for (i = istart; i < iend; i++)
+    if (trans->pdls[i]->trans_parent == trans)
+      PDL_ENSURE_ALLOCATED (trans->pdls[i]);
+
+  Newxz (aj, 1, struct pdl_offload_async_job);
+  Newxz (aj->had_badflag, PDL_BITFIELD_SIZE (ncheck), PDL_BITFIELD_ENT);
+  Newxz (aj->retained, vtable->npdls, SV *);
+
+  for (i = istart; i < iend; i++)
+    if (trans->pdls[i] && trans->pdls[i]->state & PDL_BADVAL)
+      PDL_BITFIELD_SET (aj->had_badflag, i - istart);
+
+  /* Retain the participating ndarrays.  `sv` is the perl side of one, and (void *)1
+   * is the sentinel PDL uses for one it is holding itself; an ndarray with neither
+   * is the transformation's own, and lives as long as it does. */
+  for (i = 0; i < vtable->npdls; i++)
+    {
+      pdl *p = trans->pdls[i];
+
+      if (p && p->sv && p->sv != (void *)1)
+        aj->retained[aj->nretained++] = SvREFCNT_inc ((SV *)p->sv);
+    }
+
+  aj->value = newSVsv (itsv);
+  aj->job.otrans = trans;
+  aj->job.cancelled = 0;
+  aj->job.ran = 0;
+  aj->job.err = pdl_broadcast_prepare_temps (&trans->broadcast, trans);
+
+  if (aj->job.err.error)
+    {
+      PDL_err = aj->job.err;               /* nothing was queued */
+      SvREFCNT_dec (aj->value);
+      pdl_offload_async_free (aTHX_ aj);
+      return PDL_err;
+    }
+
+  *handle_out = multicore_offload (pdl_offload_work, &aj->job,
+                                  pdl_offload_async_done, aj);
+  return PDL_err;
+
+inline_it:
+  PDL_RETERROR (PDL_err, pdl_make_physical (it));
+  *handle_out = multicore_offload_ready (newSVsv (itsv));
+  return PDL_err;
+}
+#endif /* PDL_HAVE_MULTICORE_OFFLOAD */
+
+pdl_error pdl__ensure_trans(pdl_trans *trans, int what, char inputs_only, int recurse_count)
+{
+  pdl_error PDL_err = {0, NULL, 0};
+  int flag;
+  char handled;
+  PDLDEBUG_f(printf("pdl__ensure_trans %p what=", trans); pdl_dump_flags_fixspace(what, 0, PDL_FLAGS_PDL));
+  PDL_RETERROR(PDL_err, pdl__ensure_trans_prepare(trans, what, inputs_only, recurse_count, &flag, &handled));
+  if (handled)
+    return PDL_err;
   if (flag & PDL_ANYCHANGED)
     READDATA(trans);
   return PDL_err;
@@ -376,7 +849,7 @@ pdl_error pdl_destroytransform(pdl_trans *trans, int ensure, int recurse_count)
   char ismutual = (trans->flags & PDL_ITRANS_DO_DATAFLOW_ANY);
   PDLDEBUG_f(printf("pdl_destroytransform %s=%p (ensure=%d ismutual=%d)\n",
     vtable->name,trans,ensure,(int)ismutual));
-  if (ensure)
+  if (ensure && !(trans->flags & PDL_ITRANS_CANCELLED))
     PDL_ACCUMERROR(PDL_err, pdl__ensure_trans(trans, ismutual ? 0 : PDL_PARENTDIMSCHANGED, 0, recurse_count+1));
   pdl *destbuffer[vtable->npdls];
   int ndest = 0;

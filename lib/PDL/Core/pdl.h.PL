@@ -447,6 +447,12 @@ typedef struct pdl_transvtable {
 #define  PDL_ITRANS_TWOWAY            (1 << 0) /* CORE21 unused */
 #define  PDL_ITRANS_DO_DATAFLOW_F     (1 << 1)
 #define  PDL_ITRANS_DO_DATAFLOW_B     (1 << 2)
+/* This transformation was asked to stop and did (see the offload section of
+ * pdlapi.c).  Its outputs hold part of an answer, and it must not be flushed when
+ * it is destroyed: being cancelled is precisely a statement that nobody wants the
+ * result.  A genuine read of an output clears this and runs the transformation
+ * again. */
+#define  PDL_ITRANS_CANCELLED         (1 << 3)
 #define  PDL_ITRANS_DO_DATAFLOW_ANY   (PDL_ITRANS_DO_DATAFLOW_F|PDL_ITRANS_DO_DATAFLOW_B)
 
 #define  PDL_ITRANS_ISAFFINE          (1 << 12)
@@ -455,6 +461,7 @@ typedef struct pdl_transvtable {
  X(PDL_ITRANS_TWOWAY) \
  X(PDL_ITRANS_DO_DATAFLOW_F) \
  X(PDL_ITRANS_DO_DATAFLOW_B) \
+ X(PDL_ITRANS_CANCELLED) \
  X(PDL_ITRANS_ISAFFINE)
 
 #define PDL_MAXSPACE 256 /* maximal number of prefix spaces in dump routines */
@@ -649,6 +656,17 @@ typedef struct pdl_slice_args {
     register PDL_Indx __tdims1 = __tdims[1]; \
     register PDL_Indx *__offsp = PDL->get_threadoffsp(&(brc)); \
     if (!__offsp ) return PDL->make_error_simple(PDL_EFATAL, "Error in get_threadoffsp"); \
+    /* NULL unless this loop is running inside an offloaded transformation that its \
+     * caller can cancel.  Read once per chunk, tested on every turn of the tight \
+     * loop below, since one turn runs the whole of the op's body and there is no \
+     * count of turns that bounds a time: an op can have four of them and take a \
+     * second.  So the latency is one body, which is as good as it gets from out \
+     * here - work inside the body is beyond reach, and an op with one big core \
+     * dimension and nothing to broadcast over has no boundary at all.  Costs \
+     * nothing measurable either way: the pointer is loop-invariant, so the usual \
+     * NULL case leaves the loop as the compiler had it.  The caller turns a stopped \
+     * loop into an error - what is left behind here is a partial result. */ \
+    volatile int *__cancelp = PDL->offload_cancel_ptr(); \
     /* incs are each pdl's stride, declared at func start */ \
     /* offs are each pthread's starting offset into each pdl */ \
     ptrStep1 \
@@ -664,6 +682,7 @@ typedef struct pdl_slice_args {
         __tind0++ \
         PDL_EXPAND ptrStep3 \
       ) { \
+        if (__cancelp && *__cancelp) return PDL_err; \
         /* This is the tightest loop. Make sure inside is optimal. */
 #define PDL_BROADCASTLOOP_END(brc, ptrStep1) \
       } \

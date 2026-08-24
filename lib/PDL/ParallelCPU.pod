@@ -158,6 +158,70 @@ CPUs crunching away on data, you will have (for most common machine architecture
 your bottleneck. For simple calculations (e.g simple additions) you can run into a performance limit at about
 4 pthreads. For more CPU-bound calculations the limit will be higher.
 
+=head1 Releasing the interpreter: PDL under green threads
+
+The pthreads described above use several cores I<inside> one operation, but the
+perl interpreter is stopped for its duration: whatever else the program had to do
+waits until the broadcast loop finishes.
+
+On a perl that carries the core C<multicore_offload> hook, and with an offload
+backend installed, PDL also hands the loop to a worker thread and lets the
+interpreter carry on. L<Coro::Multicore> is such a backend: it couples L<Coro>'s
+green threads to a pool of OS threads, so while one green thread waits for a PDL
+operation the others keep running, and the event loop keeps turning.
+
+Nothing in PDL's interface changes for this. An ordinary operation does it:
+
+  use Coro;
+  use Coro::Multicore;
+
+  Coro::Multicore::enable_offload (1);
+
+  async { $sum = $big->sumover };   # the loop runs on a worker thread;
+  async { ...other work... };       # this green thread runs meanwhile
+
+and so does anything else that ends in evaluating a transformation -
+L<PDL::Core/make_physical>, reading a value out of a lazily computed ndarray, and
+so on. The two mechanisms compose rather than compete: the fan-out happens inside
+the offloaded work, so an operation gets its cores I<and> the interpreter stays
+free.
+
+Several green threads can also have operations in flight at once: the backend keeps
+a pool of worker threads, so two green threads each waiting on a large operation are
+using two cores, without either of them doing anything special. Two 40-Melement
+C<sumover>s, with pthreading turned off so that each gets a single core, take the
+time of one.
+
+That is where this overlaps L<PDL::Parallel::threads>, which shares ndarray data
+between ithreads so that several interpreters can work on one dataset: both
+arrangements run numeric work on shared data concurrently, and for that purpose
+green threads need no sharing mechanism at all, there being one interpreter and one
+heap. What they do not offer is parallel I<perl>. An ithread runs perl code of its
+own alongside the others; green threads take turns at the single interpreter, and
+only the C loops overlap. Perl-level work between operations therefore serialises,
+and how much a program gains depends on how much of it is inside broadcast loops.
+
+It applies to an operation that is worth the handover, which is decided the same
+way as pthreading: nothing below C<set_autopthread_size> (1 Melement by default)
+is offloaded, since starting and joining a worker costs a mutex, a condition
+variable and a turn of the event loop. An operation whose definition says it may
+not be parallelised is declined too, and so is making a slice physical, which is a
+buffer copy rather than a broadcast loop. Without the hook, or without a backend,
+the loop simply runs inline as it always has.
+
+For a caller that wants to I<hold> an operation rather than wait for it - to run
+several at once, or to C<await> one - see L<PDL::Core/make_physical_async>.
+
+Whether a given PDL can do this at all is a build-time question, and
+C<PDL::Core::offload_supported()> answers it: the hook lives in the interpreter, so
+a module cannot supply it, and PDL compiles the offload path out when the perl it
+is built against does not have it. Everything else is unaffected - the loops run
+inline, as they always did - and C<make_physical_async> refuses rather than
+pretending.
+
+This is B<experimental>: it needs a perl carrying the hook, which today means a
+patched one, and both the hook and the backend may still change.
+
 =head1 COPYRIGHT
 
 Copyright 2011 John Cerney. You can distribute and/or

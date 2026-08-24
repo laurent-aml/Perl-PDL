@@ -943,6 +943,20 @@ pdl_avref(array_ref, class, type)
 
 MODULE = PDL::Core     PACKAGE = PDL::Core     PREFIX = pdl_
 
+ # Whether this PDL was built against a perl carrying the core multicore_offload
+ # hook.  Without it every broadcast loop runs inline, as it always did, and
+ # make_physical_async has nothing to hand back.
+int
+pdl_offload_supported()
+    CODE:
+#ifdef PDL_HAVE_MULTICORE_OFFLOAD
+        RETVAL = 1;
+#else
+        RETVAL = 0;
+#endif
+    OUTPUT:
+        RETVAL
+
 int
 pdl_pthreads_enabled()
 
@@ -971,6 +985,22 @@ make_physvaffine(self)
 	CODE:
 		pdl_barf_if_error(pdl_make_physvaffine(self));
 		RETVAL = self;
+	OUTPUT:
+		RETVAL
+
+ # The asynchronous twin of make_physical: run the pending transformation off the
+ # interpreter thread and hand back the offload backend's HANDLE instead of waiting
+ # for it.  await it, or call get on it, to get the ndarray back physical.
+ #
+ # Something has to have set the transformation up without running it, which is what
+ # dataflow does - so this is worth calling on the child of a flowing ndarray.  An
+ # ndarray with nothing pending comes back in an already-resolved handle, so the
+ # caller never has to ask which happened.
+SV *
+make_physical_async(self, ...)
+	pdl *self;
+	CODE:
+		pdl_barf_if_error(pdl_make_physical_async(aTHX_ self, ST(0), &RETVAL));
 	OUTPUT:
 		RETVAL
 

@@ -1520,6 +1520,61 @@ might want to consider using the PDL preprocessor
 which can be used to transparently access virtual ndarrays without the
 need to physicalise them (though there are exceptions).
 
+If there is a transformation waiting to be run, this is where it runs - and on a
+perl carrying the core C<multicore_offload> hook, with a backend such as
+L<Coro::Multicore> installed, an operation big enough to be worth it runs its loop
+on a worker thread while the interpreter carries on. Under L<Coro> that means the
+calling green thread waits and the others run; the call itself is unchanged, and
+returns the same ndarray it always did. The same is true of any other route to
+evaluating a transformation, an ordinary C<< $b = $a->sumover >> included. See
+L<PDL::ParallelCPU/"Releasing the interpreter: PDL under green threads">, and
+C<make_physical_async> below for the form that hands the operation back instead of
+waiting for it.
+
+=head2 make_physical_async
+
+=for ref
+
+Like C<make_physical>, but run the pending transformation off the interpreter
+thread and hand back a I<handle> for it rather than waiting.
+
+=for example
+
+ $x->flowing;                          # so the operation is set up, not run
+ my $sum = $x->sumover;
+ my $handle = $sum->make_physical_async;
+
+ # ... other threads run while it computes ...
+
+ my $result = $handle->get;            # $sum, now physical
+
+This is B<experimental>, and it does nothing on its own: it needs a perl carrying
+the C<multicore_offload> hook and an offload backend installed in it - such as
+L<Coro::Multicore>, which is the backend for L<Coro>'s green threads - and PDL
+only offloads an operation big enough to be worth a worker thread (see
+L<PDL::ParallelCPU/"Releasing the interpreter: PDL under green threads">).
+Without the hook this method C<die>s; C<PDL::Core::offload_supported()> says
+whether it is there. Without those the transformation is simply run here, and the handle
+that comes back is already resolved - so the caller never has to ask which
+happened.
+
+The handle is the backend's, and the class is deliberately not something to name:
+the methods are fixed (F<perlmulticore.h> in a patched perl), so C<get> works
+under a green-thread backend and C<await> under a stackless one. C<< $handle->cancel >>
+asks the operation to stop early, advisory and only as prompt as the loop's own
+polling; a cancelled transformation is reported as an error and is I<not> left
+half-written for the next reader.
+
+Something has to have set the transformation up without running it, which is what
+dataflow does - hence the C<flowing> above. An ndarray with nothing pending comes
+back in a resolved handle.
+
+While the operation runs, the participating ndarrays are held alive for it, so it
+is safe to drop every reference to them; and dropping the handle itself asks the
+work to stop and waits for it. What is B<not> guarded is modifying an input while
+the worker is reading it: a green thread waiting on the handle cannot, but a
+stackless caller is still running and can.
+
 =head2 make_physvaffine
 
 =for ref

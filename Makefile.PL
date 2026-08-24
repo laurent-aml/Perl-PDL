@@ -63,6 +63,24 @@ if (!$pthread_library) {
     print "\t==> Enabling perl threads will not help!\n";
 }
 my $pthread_define  = $pthread_library ? ' -DPDL_PTHREAD ' : '';
+
+# Does this perl carry the core multicore_offload hook?  If it does, the broadcast
+# loop of a large enough transformation can run on a worker thread while the
+# interpreter goes on with something else (see PDL::ParallelCPU).  If it does not,
+# the offload path is compiled out and every loop runs inline as it always has -
+# the hook is an interpreter feature, so it cannot be supplied by a module.
+my $offload_define = '';
+{
+    my $core_h = catfile $Config{archlibexp}, 'CORE', 'perlmulticore.h';
+    if (open my $fh, '<', $core_h) {
+        local $/;
+        $offload_define = ' -DPDL_HAVE_MULTICORE_OFFLOAD '
+            if readline ($fh) =~ /multicore_register_offload/;
+    }
+    print $offload_define
+        ? "PDL will be built with multicore offload support.\n"
+        : "PDL will be built without multicore offload support (this perl has no multicore_offload hook).\n";
+}
 my $libs_string = "$pthread_library ".get_maths_libs();
 
 my $hdeps = join ' ', map catfile(qw(lib PDL Core), $_), qw(pdl.h pdlperl.h pdlcore.h pdlbroadcast.h pdlmagic.h);
@@ -140,7 +158,7 @@ my %makefile_hash = (
       },
     },
   },
-  DEFINE => $pthread_define,
+  DEFINE => $pthread_define . $offload_define,
   LIBS => [$libs_string],
   depend => {
     $core_obj => $hdeps,
