@@ -374,6 +374,17 @@ sub PDL::ftrPM {
 EOPM
       );
 
+pp_def('warnrow',
+       Pars => 'a(n); [o]b()',
+       GenericTypes => ['D'],
+       Code => '
+         double sum = 0;
+         loop(n) %{ sum += $a(); %}
+         $b() = sum;
+         PDL->pdl_warn("warnrow: summed %.0f", sum);
+       ',
+      );
+
 pp_done;
 
 # this tests the bug with a trailing comment and *no* newline
@@ -545,6 +556,37 @@ undef $main::FOOTERVAL;
 ftrPM(1);
 is $main::HEADERVAL, 1;
 is $main::FOOTERVAL, 1;
+
+SKIP: {
+# A warning raised from inside a broadcast loop cannot go to perl when the loop is
+# being run by pthreads, so the pthread buffers it and the thread that spawned them
+# reports the lot afterwards.  All of them, and as they were written: each message
+# used to be appended one byte past the terminator of the last, which left
+# everything after the first unreachable to the "%s" that reports the buffer, and
+# each was formatted from a va_list already consumed by measuring it, which on some
+# ABIs writes a message of a different length than the one measured.  Checking the
+# sums, not just the count, covers both.
+skip 'this PDL was built without pthreads', 1 if !PDL::Core::pthreads_enabled;
+my $rows = 8;
+my $x = sequence(4, $rows);
+PDL::set_autopthread_targ(4);
+PDL::set_autopthread_size(0);   # no size floor, so this small one still splits
+my @w;
+{
+  local $SIG{__WARN__} = sub { push @w, $_[0] };
+  my $o = $x->warnrow;
+  $o->make_physical;
+}
+my $threads = PDL::get_autopthread_actual();
+PDL::set_autopthread_targ(1);
+# How many pthreads a machine gives us is not ours to decide, and with one the
+# warnings never take the deferred path at all - there is then nothing to check.
+skip "the loop was not split (autopthread gave $threads)", 1 if $threads < 2;
+my @got  = sort { $a <=> $b } join("", @w) =~ /warnrow: summed (\S+)/g;
+my @want = sort { $a <=> $b } map { 0 + $x->slice(":,($_)")->sum } 0 .. $rows - 1;
+is_deeply \@got, \@want,
+  "every warning the $threads pthreads deferred is reported, with the message it wrote";
+}
 
 done_testing;
 EOF

@@ -114,6 +114,22 @@ void pdl_run_delayed_magic(void);
 
 /* Deferred barfing and warning when pthreading  */
 char pdl_pthread_main_thread(void);
+
+/* We can only barf/warn from a thread that holds the interpreter, so a worker
+ * pthread complains into a buffer and the thread that spawned it reports the lot
+ * afterwards.  One of these holds those buffers.
+ *
+ * There is one per in-flight pdl_magic_thread_cast, and a worker reaches its own
+ * through thread-local storage rather than by comparing itself against a
+ * process-wide record of which thread is the interpreter's.  Two casts in flight at
+ * once therefore keep their complaints apart, and each is reported by the thread
+ * that spawned it. */
+typedef struct pdl_pthread_ctx {
+  char  *barf_msgs;
+  size_t barf_msgs_len;
+  char  *warn_msgs;
+  size_t warn_msgs_len;
+} pdl_pthread_ctx;
 int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args);
 void pdl_pthread_realloc_vsnprintf(char **p, size_t *len, size_t extralen, const char *pat, va_list *args, char add_newline);
 void pdl_pthread_free(void *p);

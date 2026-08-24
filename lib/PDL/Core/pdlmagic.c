@@ -1,25 +1,25 @@
 #include "pdlcore.h"
 
-/* Variable storing the pthread ID for the main PDL thread.
- *  This is used to tell if we are in the main pthread, or in one of
- *  the pthreads spawned for PDL processing
- * This is only used when compiled with pthreads.
- */
 #ifdef PDL_PTHREAD
-static pthread_t pdl_main_pthreadID;
-static int done_pdl_main_pthreadID_init = 0;
 
-/* deferred error messages are stored here. We can only barf/warn from the main
- *  thread, so worker threads complain here and the complaints are printed out
- *  altogether later
- */
-static char* pdl_pthread_barf_msgs     = NULL;
-static size_t pdl_pthread_barf_msgs_len = 0;
-static char* pdl_pthread_warn_msgs     = NULL;
-static size_t pdl_pthread_warn_msgs_len = 0;
+static pthread_key_t pdl_pthread_ctx_key;
+static pthread_once_t pdl_pthread_ctx_once = PTHREAD_ONCE_INIT;
+
+static void pdl_pthread_ctx_key_init(void) {
+  pthread_key_create(&pdl_pthread_ctx_key, NULL);
+}
+
+static pdl_pthread_ctx *pdl_pthread_ctx_get(void) {
+  pthread_once(&pdl_pthread_ctx_once, pdl_pthread_ctx_key_init);
+  return (pdl_pthread_ctx *)pthread_getspecific(pdl_pthread_ctx_key);
+}
+
+static void pdl_pthread_ctx_set(pdl_pthread_ctx *ctx) {
+  pthread_once(&pdl_pthread_ctx_once, pdl_pthread_ctx_key_init);
+  pthread_setspecific(pdl_pthread_ctx_key, ctx);
+}
 
 #endif
-
 
 /* Singly linked list */
 /* Note that this zeroes ->next!) */
@@ -214,6 +214,7 @@ typedef struct ptarg {
 	pdl_trans *t;
 	int no;
 	pdl_error error_return;
+	pdl_pthread_ctx *ctx;
 } ptarg;
 
 int pdl_pthreads_enabled(void) {return 1;}
@@ -223,6 +224,7 @@ static void *pthread_perform(void *vp) {
 	struct ptarg *p = (ptarg *)vp;
 	PDLDEBUG_f(printf("STARTING THREAD %d (%lu)\n",p->no, (long unsigned)pthread_self()));
 	pthread_setspecific(p->mag->key,(void *)&(p->no));
+	pdl_pthread_ctx_set(p->ctx);
 	int oldtype; /* don't care but must supply */
 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
 	p->error_return = (p->func)(p->t);
@@ -270,12 +272,9 @@ pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans
 	pthread_t tp[broadcast->mag_nthr];
 	ptarg tparg[broadcast->mag_nthr];
 	pthread_key_create(&(ptr->key),NULL);
-	/* Get the pthread ID of this main thread we are in.
-	 *	Any barf, warn, etc calls in the spawned pthreads can use this
-	 *	to tell if it's a spawned pthread
-	 */
-	pdl_main_pthreadID = pthread_self();
-	done_pdl_main_pthreadID_init = 1;
+	/* Where the pthreads we are about to spawn will leave anything they have to
+	 * say; they find it through TLS, and we report it once they have joined. */
+	pdl_pthread_ctx ctx = {NULL, 0, NULL, 0};
 
 	PDLDEBUG_f(printf("CREATING THREADS, ME: TBD, key: %ld\n", (unsigned long)(ptr->key)));
 	PDL_Indx i, last_pthread = -1;
@@ -285,6 +284,7 @@ pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans
 	    tparg[i].t = t;
 	    tparg[i].no = i;
 	    tparg[i].error_return = PDL_err;
+	    tparg[i].ctx = &ctx;
 	    if (pthread_create(tp+i, NULL, pthread_perform, tparg+i))
 	      break;
 	    last_pthread = i;
@@ -302,7 +302,6 @@ pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans
 	PDLDEBUG_f(printf("FINISHED THREADS, ME: TBD, key: %ld\n", (unsigned long)(ptr->key)));
 
 	pthread_key_delete((ptr->key));
-	done_pdl_main_pthreadID_init = 0;
 
 	/* Remove pthread magic if we created in this function */
 	if( clearMagic ){
@@ -311,19 +310,19 @@ pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans
 
 #define handle_deferred_errors(type, action)							\
 	do{															\
-		if(pdl_pthread_##type##_msgs_len != 0)					\
+		if(ctx.type##_msgs_len != 0)							\
 		{														\
-			pdl_pthread_##type##_msgs_len = 0;					\
+			ctx.type##_msgs_len = 0;							\
 			action;	\
 			pdl_pthread_free(ctx.type##_msgs);						\
-			pdl_pthread_##type##_msgs	  = NULL;				\
+			ctx.type##_msgs	  = NULL;							\
 		}														\
 	} while(0)
 
-	handle_deferred_errors(warn, pdl_pdl_warn("%s", pdl_pthread_warn_msgs));
+	handle_deferred_errors(warn, pdl_pdl_warn("%s", ctx.warn_msgs));
 	if (last_pthread < broadcast->mag_nthr-1)
 	  return pdl_make_error_simple(PDL_EFATAL, "Failed to create at least one thread, aborting");
-	handle_deferred_errors(barf, PDL_err = pdl_error_accumulate(PDL_err, pdl_make_error(PDL_EUSERERROR, "%s", pdl_pthread_barf_msgs)));
+	handle_deferred_errors(barf, PDL_err = pdl_error_accumulate(PDL_err, pdl_make_error(PDL_EUSERERROR, "%s", ctx.barf_msgs)));
 	for(i=0; i<broadcast->mag_nthr; i++) {
 	    PDL_err = pdl_error_accumulate(PDL_err, tparg[i].error_return);
 	}
@@ -367,8 +366,10 @@ pdl_error pdl_add_threading_magic(pdl *it,PDL_Indx nthdim,PDL_Indx nthreads)
 	return PDL_err;
 }
 
+/* Whether this thread is one pdl_magic_thread_cast spawned - it has a context to
+ * complain into - or the one that spawned them, which can barf and warn for real. */
 char pdl_pthread_main_thread(void) {
-  return !done_pdl_main_pthreadID_init || pthread_equal( pdl_main_pthreadID, pthread_self() );
+  return !pdl_pthread_ctx_get();
 }
 
 // Barf/warn function for deferred barf message handling during pthreading We
@@ -383,17 +384,18 @@ int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args)
 	size_t* len;
 
 	/* Don't do anything if we are in the main pthread */
-	if (pdl_pthread_main_thread()) return 0;
+	pdl_pthread_ctx *ctx = pdl_pthread_ctx_get();
+	if (!ctx) return 0;
 
 	if(iswarn)
 	{
-		msgs = &pdl_pthread_warn_msgs;
-		len = &pdl_pthread_warn_msgs_len;
+		msgs = &ctx->warn_msgs;
+		len = &ctx->warn_msgs_len;
 	}
 	else
 	{
-		msgs = &pdl_pthread_barf_msgs;
-		len = &pdl_pthread_barf_msgs_len;
+		msgs = &ctx->barf_msgs;
+		len = &ctx->barf_msgs_len;
 	}
 
 	/* Size it from a copy: vsnprintf consumes the va_list, and the append below
