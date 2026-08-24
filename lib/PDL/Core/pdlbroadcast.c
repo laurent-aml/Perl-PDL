@@ -522,6 +522,31 @@ pdl_error pdl_broadcast_create_parameter(pdl_broadcast *broadcast, PDL_Indx j,PD
 	return PDL_err;
 }
 
+/* Each pthread of a fan-out writes into its own slice of the per-thread temporary
+ * ndarrays, so those have to be sized for the number of threads and made physical
+ * before any of them starts.  Doing that allocates, which means going through perl,
+ * so it is kept out of the loop and callable in advance - a caller that is about to
+ * run the loop somewhere perl cannot be reached can get it out of the way first.
+ *
+ * Idempotent: a second call finds the temporaries already the right shape and
+ * already physical, and does nothing. */
+pdl_error pdl_broadcast_prepare_temps(pdl_broadcast *broadcast, pdl_trans *t) {
+  pdl_error PDL_err = {0, NULL, 0};
+  PDL_Indx j;
+  /* not fanning out, so there is nothing to divide up */
+  if (!(broadcast->gflags & PDL_BROADCAST_MAGICKED) || broadcast->mag_nthr <= 0)
+    return PDL_err;
+  for (j=0; j<broadcast->npdls; j++) {
+    if (!(t->vtable->par_flags[j] & PDL_PARAM_ISTEMP)) continue;
+    pdl *it = broadcast->pdls[j];
+    if (!it || !it->ndims) continue;
+    it->dims[it->ndims-1] = broadcast->mag_nthr;
+    pdl_resize_defaultincs(it);
+    PDL_RETERROR(PDL_err, pdl_make_physical(it));
+  }
+  return PDL_err;
+}
+
 int pdl_startbroadcastloop(pdl_broadcast *broadcast,pdl_error (*func)(pdl_trans *),
       pdl_trans *t, pdl_error *error_ret) {
   PDL_Indx j, npdls = broadcast->npdls;
@@ -533,18 +558,12 @@ int pdl_startbroadcastloop(pdl_broadcast *broadcast,pdl_error (*func)(pdl_trans 
     else {
       broadcast->gflags |= PDL_BROADCAST_MAGICK_BUSY;
       /* Do the broadcastloop magically (i.e. in parallel) */
-      for (j=0; j<npdls; j++) {
-        if (!(t->vtable->par_flags[j] & PDL_PARAM_ISTEMP)) continue;
-        pdl *it = broadcast->pdls[j];
-        it->dims[it->ndims-1] = broadcast->mag_nthr;
-        pdl_resize_defaultincs(it);
-        pdl_error PDL_err = pdl_make_physical(it);
-        if (PDL_err.error) {
-          *error_ret = PDL_err;
-          return 1;
-        }
+      pdl_error PDL_err = pdl_broadcast_prepare_temps(broadcast, t);
+      if (PDL_err.error) {
+        *error_ret = PDL_err;
+        return 1;
       }
-      pdl_error PDL_err = pdl_magic_thread_cast(broadcast->pdls[broadcast->mag_nthpdl],
+      PDL_err = pdl_magic_thread_cast(broadcast->pdls[broadcast->mag_nthpdl],
         func,t, broadcast);
       if (PDL_err.error) {
         *error_ret = PDL_err;

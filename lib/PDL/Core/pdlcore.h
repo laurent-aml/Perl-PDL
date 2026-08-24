@@ -60,6 +60,9 @@ pdl_error pdl_dim_checks(pdl_transvtable *vtable, pdl **pdls,
   PDL_Indx *ind_sizes, char load_only);
 PDL_Indx pdl_get_offset(PDL_Indx* pos, PDL_Indx* dims, PDL_Indx *incs, PDL_Indx offset, PDL_Indx ndims);
 pdl_error pdl_propagate_badflag_dir(pdl *it, int newval, char is_fwd, int recurse_count);
+/* size the per-thread temporaries and make them physical, ahead of the loop that
+ * uses them (pdlbroadcast.c) */
+pdl_error pdl_broadcast_prepare_temps(pdl_broadcast *broadcast, pdl_trans *t);
 
 /* pdlutil.c */
 typedef enum {
