@@ -315,7 +315,7 @@ pdl_error pdl_magic_thread_cast(pdl *it,pdl_error (*func)(pdl_trans *),pdl_trans
 		{														\
 			pdl_pthread_##type##_msgs_len = 0;					\
 			action;	\
-			free(pdl_pthread_##type##_msgs);					\
+			pdl_pthread_free(ctx.type##_msgs);						\
 			pdl_pthread_##type##_msgs	  = NULL;				\
 		}														\
 	} while(0)
