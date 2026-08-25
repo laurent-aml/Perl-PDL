@@ -261,7 +261,9 @@ void* pdl_smalloc ( STRLEN nbytes ) {
     /* If we're in a worker thread, we queue the \
      * barf/warn for later, and exit the thread ... \
      */ \
-    if ( pdl_pthread_barf_or_warn(pat, iswarn, &args) ) \
+    int handled = pdl_pthread_barf_or_warn(pat, iswarn, &args); \
+    va_end(args); \
+    if (handled) \
       return; \
     /* ... otherwise we fall through and barf by calling \
      * the perl-level PDL::barf() or PDL::cluck() \

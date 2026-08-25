@@ -396,9 +396,19 @@ int pdl_pthread_barf_or_warn(const char* pat, int iswarn, va_list *args)
 		len = &pdl_pthread_barf_msgs_len;
 	}
 
-	size_t extralen = vsnprintf(NULL, 0, pat, *args);
-	// add the new complaint to the list
-	pdl_pthread_realloc_vsnprintf(msgs, len, extralen, pat, args, 1);
+	/* Size it from a copy: vsnprintf consumes the va_list, and the append below
+	 * needs the arguments too.  Measuring with the caller's own list left the
+	 * append formatting whatever came after them, which on some ABIs is a message
+	 * of a different length than the one just measured. */
+	va_list sizer;
+	va_copy(sizer, *args);
+	int msglen = vsnprintf(NULL, 0, pat, sizer);
+	va_end(sizer);
+	// add the new complaint to the list.  If it cannot be formatted at all, say
+	// nothing rather than corrupt the buffer, but carry on to the tail below: what
+	// must not happen either way is this thread calling perl.
+	if (msglen >= 0)
+	  pdl_pthread_realloc_vsnprintf(msgs, len, (size_t)msglen, pat, args, 1);
 
 	if(iswarn)
 	{
@@ -421,11 +431,20 @@ void pdl_pthread_realloc_vsnprintf(char **p, size_t *len, size_t extralen, const
 #ifdef WIN32
 #undef realloc
 #endif
-  if (add_newline) extralen += 1;
-  extralen += 1; /* +1 for '\0' at end */
-  *p = realloc(*p, *len + extralen);
-  vsnprintf(*p + *len, extralen, pat, *args);
-  *len += extralen; /* update the length-so-far, includes '\0' */
+  /* Write over the terminator left by the last message, not after it: appending
+   * past it left everything but the first message unreachable to the "%s" that
+   * eventually reports the buffer.
+   *
+   * And place the newline and terminator by what vsnprintf actually wrote rather
+   * than by the length someone predicted for it.  If a caller predicts more than
+   * gets written, trusting the prediction leaves a stray '\0' inside the buffer,
+   * and the "%s" stops there - so everything appended after it is lost. */
+  size_t start = *len ? *len - 1 : 0;
+  *p = realloc(*p, start + extralen + 2); /* the message, a newline, a '\0' */
+  int written = vsnprintf(*p + start, extralen + 1, pat, *args);
+  if (written < 0) written = 0;
+  if ((size_t)written > extralen) written = extralen; /* it was truncated */
+  *len = start + written + (add_newline ? 1 : 0) + 1;
   if (add_newline) (*p)[*len-2] = '\n';
   (*p)[*len-1] = '\0';
   pthread_mutex_unlock( &mutex );
